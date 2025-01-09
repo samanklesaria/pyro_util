@@ -1,14 +1,20 @@
+# type: ignore
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, Predictive
 from numpyro import handlers
+import numpyro
+from numpyro.contrib.hsgp.laplacian import eigenfunctions
+from numpyro.contrib.hsgp.spectral_densities import (
+    diag_spectral_density_squared_exponential
+)
 import jax
 import jax.numpy as jnp
 import xarray as xr
 from typing import Optional, Union
 import pandas as pd
-import numpy as np
 from patsy import dmatrices, Term
 import arviz as az
+from collections import namedtuple
 
 def fit_nuts(model, *args, num_samples=1000, **kwargs):
     "Run four chains with 500 warmup samples using the NUTS kernel."
@@ -17,9 +23,9 @@ def fit_nuts(model, *args, num_samples=1000, **kwargs):
     mcmc.run(jax.random.PRNGKey(0), *args, **kwargs)
     return mcmc
 
-def from_numpyro(df, model, mcmc, *args):
-    post_pred = Predictive(model, mcmc.get_samples())(jax.random.PRNGKey(1), *args, predictive=True)
-    prior = Predictive(model, num_samples=1000)(jax.random.PRNGKey(2), *args, predictive=True)
+def from_numpyro(df, model, mcmc, *args, predictive=True):
+    post_pred = Predictive(model, mcmc.get_samples())(jax.random.PRNGKey(1), *args, predictive=True) if predictive else None
+    prior = Predictive(model, num_samples=1000)(jax.random.PRNGKey(2), *args, predictive=True) if predictive else None
     dimwrap = extract_dims()
     with dimwrap:
         with handlers.seed(rng_seed=1):
@@ -28,8 +34,9 @@ def from_numpyro(df, model, mcmc, *args):
         prior=prior,
         posterior_predictive=post_pred,
         dims=dimwrap.dims)
-    result.constant_data = xr.Dataset.from_dataframe(df)
-    result._groups.append('constant_data')
+    if df is not None:
+        result.constant_data = xr.Dataset.from_dataframe(df)
+        result._groups.append('constant_data')
     return result
 
 class extract_dims(handlers.Messenger):
@@ -56,50 +63,32 @@ def glm(formula: str, df: pd.DataFrame, family: dist.Distribution = dist.Normal,
     so e.g. count observations with Poisson families are on a log scale.
     If the `groups` argument is provided, separate variance parameters are found for each group.
     """
-    y, X = dmatrices(formula, df)
+    y, design = dmatrices(formula, df)
     y = jnp.array(y[:,0])
-    info = X.design_info.factor_infos
-    mu = 0.0
-    for (k,v) in X.design_info.term_slices.items():
+    X = jnp.array(design)
+    mle_params = jnp.linalg.solve(X.T @ X, X.T @ y)
+    stdy = y.std()
+    stds = 2.5 * stdy / X.std(axis=0)
+    mu = 0.0 # Observation mean for each unit
+    for (k,v) in design.design_info.term_slices.items():
+        subX = X[:, v]
+        loc = mle_params[v] if k == Term([]) else jnp.zeros(1)
+        K = subX.shape[1]
+        if K == 1:
+            beta = numpyro.sample(k.name(), dist.Normal(loc[0], 2.5 * stdy if  k == Term([]) else stds[v][0]))
+            mu = mu + jnp.array(subX[:, 0]) * beta
+        else: # Stack categorical factors into their own plate
+            with numpyro.plate(k.name() + "s", K):
+                beta = numpyro.sample(k.name(), dist.Normal(loc, 2.5 * stdy if  k == Term([]) else stds[v]))
+                mu = mu + subX @ beta
 
-        # The intercept term has a normal prior around the average y value
-        if k == Term([]):
-            baseline_y = y[baseline_mask(df, info)]
-            mu = mu + numpyro.sample(k.name(), dist.Normal(baseline_y.mean(), 2.5 * baseline_y.std()))
-
-        # Priors for coefficients for continuous factors are normal about zero with scale $2.5 \sigma_y / \sigma_x$.
-        # This is equivalent to standardizing the predictors and letting the scales be $2.5 \sigma_y$.
-        # In this case, the cofficients represent the change in $y$ we would get by increasing each covariate by a
-        # single standard deviation. Allowing each change in $x$ to produce a change in $y$ covering almost all of
-        # the observed variance (2.5 standard deviations) therefore gives us a weakly informative prior.
-        else:
-            all_categorical = all(info[f].type == 'categorical' for f in k.factors)
-            subX = X[:, v]
-            mask = subX != 0.0
-            stdx, stdy = ([], [])
-            for i in range(mask.shape[1]):
-                stdx.append(1.0 if all_categorical else np.sqrt(np.square(subX[mask[:, i], i]).mean()))
-                stdy.append(y[mask[:, i]].std())
-            K = subX.shape[1]
-            if K == 1:
-                beta = numpyro.sample(k.name(), dist.Normal(0.0, 2.5 * stdy[0] / stdx[0]))
-                mu = mu + jnp.array(subX[:, 0]) * beta
-            else:
-                with numpyro.plate(k.name() + "s", K):
-                    beta = numpyro.sample(k.name(),
-                        dist.Normal(jnp.zeros(K), 2.5 * jnp.stack(stdy) / jnp.stack(stdx)))
-                mu = mu + jnp.array(subX) @ beta
-
-    # The scale of the noise is given an Exponential prior with a mean matching the observed standard deviation.
-    # We certainly wouldn't expect noise scales larger than this, as regressing on covariates should allow us to
-    # *reduce* the variance rather than increasing it.
     if family is not dist.Poisson:
         if groups is not None:
             with numpyro.plate("groups", df[groups].nunique()):
-               sigmas = numpyro.sample("sigma", dist.Exponential(1 / y.std()))
+               sigmas = numpyro.sample("sigma", dist.Exponential(1 / stdy))
                sigma = sigmas[df[groups].cat.codes.to_numpy()]
         else:
-            sigma = numpyro.sample("sigma", dist.Exponential(1 / y.std()))
+            sigma = numpyro.sample("sigma", dist.Exponential(1 / stdy))
     if family is dist.Poisson:
         data_dist = dist.Poisson(jnp.exp(mu))
         obs = jnp.exp(y) # Assuming data is log counts
@@ -116,10 +105,22 @@ def glm(formula: str, df: pd.DataFrame, family: dist.Distribution = dist.Normal,
             numpyro.deterministic("mu", mu)
             return numpyro.sample('y', data_dist, obs=None if predictive else obs)
 
-def baseline_mask(df, info):
-    "Find the elements of `df` which have categorical covariates at baseline levels."
-    mask = np.ones(df.shape[0], dtype=bool)
-    for (k,v) in info.items():
-        if v.type == 'categorical':
-            mask &= (df[k.name()] == v.categories[0]).to_numpy()
-    return mask
+class hsgp(namedtuple("hsgp", "spd beta ell m")):
+    __slots__ = ()
+    def at(self, x):
+        phi = eigenfunctions(x=x, ell=self.ell, m=self.m)
+        return phi @ (self.spd * self.beta)
+
+def hsgp_rbf(
+    prefix: str,
+    alpha: float,
+    ell: float,
+    m: int,
+    length: Union[float,list[float]]) -> hsgp:
+    dim = len(length) if hasattr(length.__class__, "__len__") else 1
+    spd = jnp.sqrt(diag_spectral_density_squared_exponential(
+            alpha=alpha, length=length, ell=ell, m=m, dim=dim))
+    with handlers.scope(prefix=prefix):
+        with numpyro.plate("basis", len(spd)):
+            beta = numpyro.sample("beta", dist.Normal())
+    return hsgp(spd, beta, ell, m)
