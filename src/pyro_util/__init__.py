@@ -1,26 +1,27 @@
 # type: ignore
-import inspect
 from collections import namedtuple
+import inspect
 from typing import Optional, Union
 
 import arviz as az
 import jax
 import jax.numpy as jnp
+import numpy as np
 import numpyro
-import numpyro.distributions as dist
-import pandas as pd
-import xarray as xr
 from numpyro import handlers
 from numpyro.contrib.hsgp.laplacian import eigenfunctions
 from numpyro.contrib.hsgp.spectral_densities import \
     diag_spectral_density_squared_exponential
+import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, Predictive
+import pandas as pd
 from pandas.io.parsers.readers import Callable
 from patsy import Term, dmatrices
+import xarray as xr
 
 
 def fit_nuts(model, *args, num_samples=1000, **kwargs):
-    "Run four chains with 500 warmup samples using the NUTS kernel."
+    """Run four chains with 500 warmup samples using the NUTS kernel."""
     nuts_kernel = NUTS(model)
     mcmc = MCMC(
         nuts_kernel,
@@ -29,7 +30,6 @@ def fit_nuts(model, *args, num_samples=1000, **kwargs):
         num_chains=4)
     mcmc.run(jax.random.PRNGKey(0), *args, **kwargs)
     return mcmc
-
 
 def from_numpyro(df: Optional[pd.DataFrame], model: Callable, mcmc: MCMC, *args, predictive=True):
     """Create `InferenceData` from a `MCMC` run of `model` with sections for posterior and prior
@@ -77,6 +77,13 @@ class extract_dims(handlers.Messenger):
             dims.reverse()
             self.dims[msg['name']] = dims
 
+def to_pytree(df, cols, groups):
+    grouped = df.groupby(groups)[cols].first()
+    gdf = grouped.reindex(index=pd.MultiIndex.from_product(grouped.index.levels))
+    reshaped = np.reshape(gdf.values, (*gdf.index.levshape, len(cols)))
+    results = list(reshaped.transpose())
+    results.append(~np.isnan(results[0]))
+    return results
 
 def glm(formula: str, df: pd.DataFrame, family: dist.Distribution = dist.Normal,
         prior: dist.Distribution = dist.Normal, groups: Optional[str] = None,
@@ -157,7 +164,7 @@ def hsgp_rbf(
     """Sample a `hsgp` with an RBF kernel.
 
     Parameters:
-    `prefix`:   Prefix fpr sample sites of eigenvector coefficients
+    `prefix`:   Prefix for sample sites of eigenvector coefficients
     `alpha`:    Uniform scaling for the kernel
     `ell`:      Kernel lengthscale
     `length`:   Length of the interval from zero for which the approximation should be accurate
