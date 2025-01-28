@@ -77,7 +77,21 @@ class extract_dims(handlers.Messenger):
             dims.reverse()
             self.dims[msg['name']] = dims
 
-def to_pytree(df, cols, groups):
+def to_pytree(df: pd.DataFrame, cols: list[str], groups: list[str]):
+    """Convert `df` into a list of multidimensional arrays: one per element of
+   `cols`. The `groups` argument determines the shape of these arrays. The final
+   element of the returned list is a mask picking out values in the original
+   dataframe.
+
+   >>> df = pd.DataFrame({'a': [1,2,1,2,1], 'b': [0,0,1,1,2], 'c': np.arange(5)})
+   >>> to_pytree(df, ['c'], ['a', 'b'])
+   [array([[ 0.,  1.],
+           [ 2.,  3.],
+           [ 4., nan]]),
+    array([[ True,  True],
+           [ True,  True],
+           [ True, False]])]
+    """
     grouped = df.groupby(groups)[cols].first()
     gdf = grouped.reindex(index=pd.MultiIndex.from_product(grouped.index.levels))
     reshaped = np.reshape(gdf.values, (*gdf.index.levshape, len(cols)))
