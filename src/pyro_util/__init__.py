@@ -16,9 +16,9 @@ import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, Predictive
 import pandas as pd
 from pandas.io.parsers.readers import Callable
-from patsy import Term, dmatrices
+from patsy import Term
+import patsy
 import xarray as xr
-
 
 def fit_nuts(model, *args, num_samples=1000, **kwargs):
     """Run four chains with 500 warmup samples using the NUTS kernel."""
@@ -60,7 +60,6 @@ def from_numpyro(df: Optional[pd.DataFrame], model: Callable, mcmc: MCMC, *args,
         result._groups.append('constant_data')
     return result
 
-
 class extract_dims(handlers.Messenger):
     """Track the plates associated with each sample site.
     The resulting map from sample names to lists of plates is stored
@@ -77,11 +76,25 @@ class extract_dims(handlers.Messenger):
             dims.reverse()
             self.dims[msg['name']] = dims
 
+def to_tensor(df: pd.DataFrame, cols: list[str], groups: list[str]):
+    """Convert `df` to a tensor for which every dimension but the last enumerates possible values
+    of a different covariate in `groups`. Also returns the associated index.
+    """
+    gdf = df.groupby(groups)[cols].first()
+    if len(groups) > 1:
+        ix = pd.MultiIndex.from_product(gdf.index.levels)
+        gdf = gdf.reindex(index=ix)
+        shape = gdf.index.levshape
+    else:
+        shape = gdf.index.shape
+    return np.reshape(gdf.values, (*shape, -1)), gdf.index
+
 def to_pytree(df: pd.DataFrame, cols: list[str], groups: list[str]):
     """Convert `df` into a list of multidimensional arrays: one per element of
-   `cols`. The `groups` argument determines the shape of these arrays. The final
-   element of the returned list is a mask picking out values in the original
-   dataframe.
+   `cols`. The dimensions of each result tensor enumerate over possible values of
+   the index variables in `groups`. The final element of the returned list is a
+   mask picking out values in the original dataframe. This is useful when specifying
+   `obs` and `obs_mask` in `numpyro.sample` statements.
 
    >>> df = pd.DataFrame({'a': [1,2,1,2,1], 'b': [0,0,1,1,2], 'c': np.arange(5)})
    >>> to_pytree(df, ['c'], ['a', 'b'])
@@ -92,69 +105,74 @@ def to_pytree(df: pd.DataFrame, cols: list[str], groups: list[str]):
            [ True,  True],
            [ True, False]])]
     """
-    grouped = df.groupby(groups)[cols].first()
-    gdf = grouped.reindex(index=pd.MultiIndex.from_product(grouped.index.levels))
-    reshaped = np.reshape(gdf.values, (*gdf.index.levshape, len(cols)))
+    reshaped, _ = to_tensor(df, cols, groups)
     results = list(reshaped.transpose())
     results.append(~np.isnan(results[0]))
     return results
 
-def glm(formula: str, df: pd.DataFrame, family: dist.Distribution = dist.Normal,
-        prior: dist.Distribution = dist.Normal, groups: Optional[str] = None,
-        weights: Optional[str] = None, obs_mask: jax.Array = None, predictive: bool = False):
-    """Run a generalized linear model following `formula` on the dataframe `df` with family
-    `family`. If the `groups` argument is provided, find separate variance parameters for each group.
-    Use the distribution `prior` as the prior distribution for coefficients.
-    If `predictive=False`, condition on the endogenous variable in `df`. Otherwise, sample a
-    result. Return the endogenous variable.
-    """
-    y, design = dmatrices(formula, df)
-    y = jnp.array(y[:, 0])
-    X = jnp.array(design)
-    mle_params = jnp.linalg.solve(X.T @ X, X.T @ y)
-    stdy = y.std() if dist is dist.Normal else 1.0
-    stds = 2.5 * stdy / X.std(axis=0)
-    mu = 0.0  # Observation mean for each unit
-    for (k, v) in design.design_info.term_slices.items():
-        subX = X[:, v]
-        loc = mle_params[v] if k == Term([]) else jnp.zeros(1)
-        K = subX.shape[1]
-        if K == 1:
-            beta = numpyro.sample(
-                k.name(),
-                prior(loc[0], 2.5 * stdy if k == Term([]) else stds[v][0]))
-            mu = mu + jnp.array(subX[:, 0]) * beta
-        else:  # Stack categorical factors into their own plate
-            with numpyro.plate(k.name() + "s", K):
-                beta = numpyro.sample(
+class glm:
+    def __init__(self, formula: str, df: pd.DataFrame, family: dist.Distribution = dist.Normal,
+            prior: dist.Distribution = dist.Normal, groups: Optional[str] = None,
+            weights: Optional[str] = None, predictive: bool = False):
+        """Run a generalized linear model following `formula` on the dataframe `df` with family
+        `family`. If the `groups` argument is provided, find separate variance parameters for each group.
+        Use the distribution `prior` as the prior distribution for coefficients.
+        If `predictive=False`, condition on the endogenous variable in `df`.
+        """
+        self.family = family
+        self.formula = patsy.ModelDesc.from_formula(formula)
+        y, design = patsy.dmatrices(self.formula, df)
+        y = jnp.array(y[:, 0])
+        X = jnp.array(design)
+        self.formula.lhs_termlist = []
+
+        mle_params = jnp.linalg.solve(X.T @ X, X.T @ y)
+        stdy = y.std() if dist is dist.Normal else 1.0
+        stds = 2.5 * stdy / X.std(axis=0)
+
+        betas = []
+        for (k, v) in design.design_info.term_slices.items():
+            loc = mle_params[v] if k == Term([]) else jnp.zeros(1)
+            K = len(stds[v])
+            if K == 1:
+                betas.append(numpyro.sample(
                     k.name(),
-                    prior(loc, 2.5 * stdy if k == Term([]) else stds[v]))
-                mu = mu + subX @ beta
+                    prior(loc[0], 2.5 * stdy if k == Term([]) else stds[v][0]))[None])
+            else:  # Stack categorical factors into their own plate
+                with numpyro.plate(k.name() + "s", K):
+                    betas.append(numpyro.sample(
+                        k.name(),
+                        prior(loc, 2.5 * stdy if k == Term([]) else stds[v])))
+        self.beta = jnp.concat(betas)
+        dist_args = set(inspect.getfullargspec(self.family).args)
+        if 'scale' in dist_args:
+            if groups is not None:
+                with numpyro.plate("groups", df[groups].nunique()):
+                    sigmas = numpyro.sample("sigma", dist.Exponential(1 / stdy))
+                    self.sigma = sigmas[df[groups].cat.codes.to_numpy()]
+            else:
+                self.sigma = numpyro.sample("sigma", dist.Exponential(1 / stdy))
+        self.at(df, prefix='train', y=None if predictive else y, weights=weights)
 
-    dist_args = set(inspect.getfullargspec(family).args)
-    if 'scale' in dist_args:
-        if groups is not None:
-            with numpyro.plate("groups", df[groups].nunique()):
-                sigmas = numpyro.sample("sigma", dist.Exponential(1 / stdy))
-                sigma = sigmas[df[groups].cat.codes.to_numpy()]
+    def at(self, df, prefix, y=None, weights=None):
+        design = patsy.dmatrix(self.formula, df)
+        X = jnp.array(design)
+        mu = X @ self.beta
+        dist_args = set(inspect.getfullargspec(self.family).args)
+        if self.family is dist.Poisson:
+            data_dist = dist.Poisson(jnp.exp(mu))
+        elif self.family is dist.Binomial:
+            data_dist = dist.Bernoulli(logits=mu)
+        elif self.family is dist.NegativeBinomial2:
+            data_dist = dist.NegativeBinomial2(jnp.exp(mu), 1 / self.sigma)
+        elif set(['loc', 'scale']) <= dist_args:
+            data_dist = self.family(mu, self.sigma)
         else:
-            sigma = numpyro.sample("sigma", dist.Exponential(1 / stdy))
-    if family is dist.Poisson:
-        data_dist = dist.Poisson(jnp.exp(mu))
-    elif family is dist.Binomial:
-        data_dist = dist.Bernoulli(logits=mu)
-    elif family is dist.NegativeBinomial2:
-        data_dist = dist.NegativeBinomial2(jnp.exp(mu), 1 / sigma)
-    elif set(['loc', 'scale']) <= dist_args:
-        data_dist = family(mu, sigma)
-    else:
-        raise Exception("Unknown family")
-    with handlers.scale(scale=jnp.array(df[weights]) if weights is not None else 1.0):
-        with numpyro.plate("obs", X.shape[0]):
-            numpyro.deterministic("mu", mu)
-            return numpyro.sample(
-                'y', data_dist, obs=None if predictive else y, obs_mask=obs_mask)
-
+            raise Exception("Unknown family")
+        with handlers.scale(scale=jnp.array(df[weights]) if weights is not None else 1.0):
+            with numpyro.plate("/".join([prefix,"obs"]), X.shape[0]):
+                numpyro.deterministic("/".join([prefix,"mu"]), mu)
+                return numpyro.sample("/".join([prefix, "y"]), data_dist, obs=y)
 
 class hsgp(namedtuple("hsgp", "spd beta ell m")):
     """Represents a sample of a Hilbert Space Gaussian Process.
@@ -170,7 +188,6 @@ class hsgp(namedtuple("hsgp", "spd beta ell m")):
     def at(self, x):
         phi = eigenfunctions(x=x, ell=self.ell, m=self.m)
         return phi @ (self.spd * self.beta)
-
 
 def hsgp_rbf(
         prefix: str, alpha: float, ell: float,
